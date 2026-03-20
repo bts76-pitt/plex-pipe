@@ -30,9 +30,26 @@ def _extract_data(x: Any) -> Any:
     return x
 
 
+def _coarsen_dask_2d(arr: da.Array, factor: int = 2) -> da.Array:
+    """Downsample a 2D dask array by `factor` using mean pooling.
+
+    Trims trailing pixels so dimensions are evenly divisible.
+    """
+    h, w = arr.shape[-2], arr.shape[-1]
+    h_trim = h - (h % factor)
+    w_trim = w - (w % factor)
+    trimmed = arr[..., :h_trim, :w_trim]
+    # Reshape into (factor x factor) blocks then take the mean.
+    if trimmed.ndim == 2:
+        return da.coarsen(np.mean, trimmed, {0: factor, 1: factor}, trim_excess=True)
+    # 3D (c, y, x)
+    return da.coarsen(np.mean, trimmed, {trimmed.ndim - 2: factor, trimmed.ndim - 1: factor}, trim_excess=True)
+
+
 def _datatree_to_dask_levels(
     multiscale_element: Any,
     max_chunk: int = 4096,
+    gl_max_texture: int = 16384,
 ) -> list[da.Array]:
     """Convert a SpatialData multiscale element into chunked dask arrays.
 
@@ -41,8 +58,11 @@ def _datatree_to_dask_levels(
     multiscale_element
         A DataTree-like object from ``sdata.images[name]``.
     max_chunk : int
-        Maximum chunk size per spatial dimension.  Keeps every tile below
-        ``GL_MAX_TEXTURE_SIZE`` so napari's tiled renderer works correctly.
+        Maximum chunk size per spatial dimension.
+    gl_max_texture : int
+        ``GL_MAX_TEXTURE_SIZE`` of the GPU.  If the smallest existing
+        pyramid level still exceeds this, additional 2x-downsampled levels
+        are generated lazily so napari can render without error.
     """
 
     def scale_idx(key: str) -> int:
@@ -63,12 +83,30 @@ def _datatree_to_dask_levels(
         if not isinstance(payload, da.Array):
             payload = da.from_array(np.asarray(payload))
 
-        # Rechunk if any chunk dimension exceeds the GL texture limit.
+        # Rechunk if any chunk dimension exceeds the limit.
         if any(c > max_chunk for c in payload.chunksize):
             new_chunks = tuple(min(c, max_chunk) for c in payload.chunksize)
             payload = payload.rechunk(new_chunks)
 
         levels.append(payload)
+
+    # Ensure the coarsest level fits within GL_MAX_TEXTURE_SIZE.
+    # If not, keep halving until it does.
+    while levels:
+        coarsest = levels[-1]
+        spatial_shape = coarsest.shape[-2:]  # (y, x)
+        if all(s <= gl_max_texture for s in spatial_shape):
+            break
+        downsampled = _coarsen_dask_2d(coarsest, factor=2)
+        # Rechunk the new level too.
+        if any(c > max_chunk for c in downsampled.chunksize):
+            new_chunks = tuple(min(c, max_chunk) for c in downsampled.chunksize)
+            downsampled = downsampled.rechunk(new_chunks)
+        levels.append(downsampled)
+        # Safety valve: don't generate more than 10 extra levels.
+        if len(levels) > 20:
+            break
+
     return levels
 
 
@@ -120,17 +158,33 @@ def _compute_max_label(mask: Any) -> int:
 # ---------------------------------------------------------------------------
 
 class RegionAnnotationWidget:
+    # Downsampling factor for the painting mask.  The mask is painted at
+    # ``full_res / downsample`` and scaled back up on save.  For coarse
+    # tissue-level annotation (ducts, lobules, stroma) this is plenty.
+    _DEFAULT_DOWNSAMPLE: int = 8
+
     def __init__(
         self,
         viewer: napari.Viewer,
         sdata: sd.SpatialData,
         image_name: str,
         img_shape: tuple[int, int],
+        downsample: int | None = None,
     ):
         self.viewer = viewer
         self.sdata = sdata
         self.image_name = image_name
         self.annotations: dict[int, dict] = {}
+
+        # Decide on downsampling.
+        self.full_shape = img_shape
+        self.downsample = downsample or self._DEFAULT_DOWNSAMPLE
+        self.paint_shape = (
+            img_shape[0] // self.downsample,
+            img_shape[1] // self.downsample,
+        )
+        # Scale transform so the labels layer aligns with the full-res images.
+        self.label_scale = (self.downsample, self.downsample)
 
         existing_regions = "tissue_regions" in sdata.labels
 
@@ -159,25 +213,33 @@ class RegionAnnotationWidget:
                     }
                 print(f"Loaded {len(self.annotations)} existing annotations")
 
-            # napari Labels needs a writable numpy array for painting.
-            # Materialize only the region mask (much smaller than image data).
-            try:
-                self.regions_layer = self.viewer.add_labels(
-                    np.asarray(existing_mask),
-                    name="tissue_regions",
-                )
-            except Exception:
-                self.regions_layer = self.viewer.add_labels(
-                    np.asarray(existing_mask),
-                    name="tissue_regions",
-                )
+            # Downsample existing mask for painting.
+            print(f"Downsampling existing mask {existing_mask.shape} -> {self.paint_shape} ({self.downsample}x)...")
+            if _is_dask_array(existing_mask):
+                existing_mask = existing_mask.compute()
+            existing_mask = np.asarray(existing_mask)
+            paint_mask = existing_mask[:: self.downsample, :: self.downsample].copy()
+            # Ensure shape matches exactly (rounding).
+            paint_mask = paint_mask[: self.paint_shape[0], : self.paint_shape[1]]
+
+            self.regions_layer = self.viewer.add_labels(
+                paint_mask,
+                name="tissue_regions",
+                scale=self.label_scale,
+                translate=(0, 0),
+            )
+            # Force the brush to work in displayed coordinates.
+            self.regions_layer.brush_size = max(1, 10 // self.downsample)
         else:
-            print("Starting fresh annotations...")
+            print(f"Starting fresh annotations (paint resolution: {self.paint_shape}, {self.downsample}x downsampled)...")
             self.current_region_id = 1
             self.regions_layer = self.viewer.add_labels(
-                np.zeros(img_shape, dtype=np.int32),
+                np.zeros(self.paint_shape, dtype=np.int32),
                 name="tissue_regions",
+                scale=self.label_scale,
+                translate=(0, 0),
             )
+            self.regions_layer.brush_size = max(1, 10 // self.downsample)
 
         # Optionally load cell segmentation as a read-only reference layer.
         if "instanseg_cell" in sdata.labels:
@@ -338,7 +400,10 @@ class RegionAnnotationWidget:
                 print("No annotations to save!")
                 return
 
-            mask_data = _ensure_background_pixel_zero(self.regions_layer.data)
+            # Save at paint resolution. No upscaling needed.
+            # The downsample factor is stored so downstream code can map
+            # full-res coordinates to label coordinates.
+            mask_data = _ensure_background_pixel_zero(self.regions_layer.data.copy())
             label_counts = _compute_label_counts(mask_data)
             unique_labels = np.nonzero(label_counts)[0]
             unique_labels = unique_labels[unique_labels != 0]
@@ -504,8 +569,28 @@ class RegionAnnotationWidget:
 # Launcher
 # ---------------------------------------------------------------------------
 
-def launch_region_annotation(sdata_path, auto_backup=True):
+def _is_jupyter() -> bool:
+    """Return True when running inside a Jupyter/IPython kernel."""
+    try:
+        from IPython import get_ipython
+        shell = get_ipython()
+        if shell is None:
+            return False
+        return shell.__class__.__name__ == "ZMQInteractiveShell"
+    except ImportError:
+        return False
+
+
+def launch_region_annotation(sdata_path, auto_backup=True, channels=None, downsample=None):
     """Launch napari for region annotation with all channels.
+
+    In a **Jupyter notebook** the viewer opens non-blocking and the function
+    returns ``(sdata, widget)`` immediately so you can keep using the
+    notebook while annotating.  Call ``save_annotations(sdata, sdata_path)``
+    when you're done.
+
+    From a **standalone script** the viewer blocks until closed, then an
+    interactive save dialog is presented in the terminal.
 
     Parameters
     ----------
@@ -513,6 +598,13 @@ def launch_region_annotation(sdata_path, auto_backup=True):
         Path to the SpatialData object.
     auto_backup : bool
         If True, suggests saving to a new path with '_annotated' suffix.
+
+    Returns
+    -------
+    sdata : SpatialData
+        The (potentially modified) SpatialData object.
+    widget : RegionAnnotationWidget
+        The annotation widget (useful for programmatic access in notebooks).
     """
     sdata = sd.read_zarr(sdata_path)
     viewer = napari.Viewer()
@@ -540,9 +632,19 @@ def launch_region_annotation(sdata_path, auto_backup=True):
         ref_img_data = ref_img_data[0]
     img_shape = ref_img_data.shape  # (y, x)
 
-    # Load all image channels lazily as multiscale pyramids.
-    print("Loading channels:")
-    for img_name in sdata.images.keys():
+    # Load image channels lazily as multiscale pyramids.
+    # If channels is provided, only load those (saves memory and startup time).
+    available = list(sdata.images.keys())
+    if channels is not None:
+        load_channels = [c for c in channels if c in available]
+        skipped = [c for c in available if c not in channels]
+        if skipped:
+            print(f"Skipping {len(skipped)} channels: {skipped}")
+    else:
+        load_channels = available
+
+    print(f"Loading {len(load_channels)} channels:")
+    for img_name in load_channels:
         print(f"  - {img_name}")
         levels = _datatree_to_dask_levels(sdata.images[img_name])
         levels = [lvl.squeeze() for lvl in levels]
@@ -576,8 +678,20 @@ def launch_region_annotation(sdata_path, auto_backup=True):
     print("- Use eraser tool to fix mistakes")
     print("- The current region ID is shown in napari's label controls")
 
-    viewer.show(block=True)
+    in_jupyter = _is_jupyter()
 
+    if in_jupyter:
+        # In Jupyter the Qt event loop is already running (via %gui qt5).
+        # Blocking would deadlock or hide the window.
+        viewer.show(block=False)
+        print("\n--- Notebook mode ---")
+        print("The napari window should now be visible.")
+        print("When you're done annotating, run in a new cell:")
+        print(f"    save_annotations(sdata, '{sdata_path}')")
+        return sdata, widget
+
+    # Standalone script: block until the viewer is closed.
+    viewer.show(block=True)
     print("\n=== Napari closed ===")
 
     original_path = Path(sdata_path)
@@ -617,7 +731,29 @@ def launch_region_annotation(sdata_path, auto_backup=True):
     else:
         print("Changes not saved to disk")
 
-    return sdata
+    return sdata, widget
+
+
+def save_annotations(sdata, sdata_path, auto_backup=True):
+    """Save annotations to disk (call from a notebook after annotating).
+
+    Parameters
+    ----------
+    sdata : SpatialData
+        The SpatialData object returned by ``launch_region_annotation``.
+    sdata_path : str or Path
+        Original path used to load the data.
+    auto_backup : bool
+        If True, saves to ``<name>_annotated.zarr`` instead of overwriting.
+    """
+    original_path = Path(sdata_path)
+    if auto_backup:
+        save_path = original_path.parent / f"{original_path.stem}_annotated.zarr"
+    else:
+        save_path = original_path
+
+    sdata.write(save_path)
+    print(f"Saved to {save_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +941,20 @@ def link_cells_to_regions(
     ).squeeze()
     region_mask = _extract_data(region_mask)
 
+    # Detect if region mask was saved at a lower resolution than the cell mask.
+    # Compare against image or cell mask shape to infer downsample factor.
+    downsample = 1
+    if cell_labels_name in sdata.labels:
+        cell_ref = sd.get_pyramid_levels(
+            sdata.labels[cell_labels_name], n=0
+        ).squeeze()
+        cell_ref = _extract_data(cell_ref)
+        cell_shape = cell_ref.shape[-2:]
+        region_shape = region_mask.shape[-2:]
+        if cell_shape[0] > region_shape[0] * 1.5:
+            downsample = round(cell_shape[0] / region_shape[0])
+            print(f"  Region mask is {downsample}x downsampled relative to cell mask")
+
     cell_table = sdata.tables[cell_table_name]
     region_table = sdata.tables["tissue_regions_table"]
 
@@ -824,16 +974,14 @@ def link_cells_to_regions(
         cy = obs["centroid_y"].values.astype(int)
         cx = obs["centroid_x"].values.astype(int)
 
-        # Clip to mask bounds.
-        mask_shape = region_mask.shape
-        cy = np.clip(cy, 0, mask_shape[0] - 1)
-        cx = np.clip(cx, 0, mask_shape[1] - 1)
+        # Point lookup: scale centroids to region mask resolution.
+        cy_scaled = np.clip(cy // downsample, 0, mask_shape[0] - 1)
+        cx_scaled = np.clip(cx // downsample, 0, mask_shape[1] - 1)
 
-        # Point lookup: compute only the needed pixels.
         if _is_dask_array(region_mask):
-            region_ids = region_mask.vindex[cy, cx].compute()
+            region_ids = region_mask.vindex[cy_scaled, cx_scaled].compute()
         else:
-            region_ids = np.asarray(region_mask)[cy, cx]
+            region_ids = np.asarray(region_mask)[cy_scaled, cx_scaled]
         region_ids = np.asarray(region_ids, dtype=int)
     else:
         # Fallback: full mask majority vote (original behavior).
