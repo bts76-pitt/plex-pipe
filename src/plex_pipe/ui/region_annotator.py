@@ -1,15 +1,116 @@
 import napari
-from napari.layers import Labels
 from magicgui import magicgui
 import spatialdata as sd
 import numpy as np
+import dask.array as da
 import pandas as pd
 from spatialdata.models import Labels2DModel, TableModel
 import anndata as ad
 from pathlib import Path
+from typing import Any
+
+
+def _is_dask_array(x: Any) -> bool:
+    return isinstance(x, da.Array)
+
+
+def _extract_data(x: Any) -> Any:
+    """Best-effort extraction of the underlying array payload."""
+    if isinstance(x, (np.ndarray, da.Array)):
+        return x
+    if hasattr(x, "data"):
+        try:
+            return x.data
+        except Exception:
+            pass
+    return x
+
+
+def _datatree_to_dask_levels(multiscale_element: Any) -> list[da.Array]:
+    """Convert a SpatialData multiscale element into dask arrays by level."""
+
+    def scale_idx(key: str) -> int:
+        key = str(key)
+        # Typical keys are like "scale0", "scale1", but accept bare digits too.
+        try:
+            return int(key.replace("scale", ""))
+        except ValueError:
+            try:
+                return int(key)
+            except ValueError:
+                return 0
+
+    items = sorted(multiscale_element.items(), key=lambda kv: scale_idx(kv[0]))
+    levels: list[da.Array] = []
+    for _, node in items:
+        da_node = next(iter(node.data_vars.values()))
+        payload = da_node.data
+        payload = _extract_data(payload)
+        if not isinstance(payload, da.Array):
+            payload = da.from_array(np.asarray(payload))
+        levels.append(payload)
+    return levels
+
+
+def _ensure_background_pixel_zero(mask: Any) -> Any:
+    """Ensure pixel (0, 0) is 0 without materializing the full mask."""
+    if not _is_dask_array(mask):
+        out = np.array(mask, copy=True)
+        if out.size:
+            out[0, 0] = 0
+        return out
+
+    mask = mask.astype(np.int32)
+
+    def _set_pixel_00(block: np.ndarray, block_info: Any | None = None) -> np.ndarray:
+        if block_info is None:
+            return block
+        # block_info["chunk-location"] is like (y_chunk_idx, x_chunk_idx)
+        chunk_location = block_info[None].get("chunk-location") if None in block_info else None
+        if chunk_location == (0, 0):
+            block = block.copy()
+            block[0, 0] = 0
+        return block
+
+    return da.map_blocks(
+        _set_pixel_00,
+        mask,
+        dtype=np.int32,
+        chunks=mask.chunks,
+    )
+
+
+def _compute_label_counts(mask: Any) -> np.ndarray:
+    """Compute per-label pixel counts for an integer mask.
+
+    Returns
+    -------
+    np.ndarray
+        1D array where index == label_id and value == pixel count.
+    """
+    mask_i = mask.astype(np.int32) if hasattr(mask, "astype") else np.asarray(mask, dtype=np.int32)
+
+    if _is_dask_array(mask_i):
+        counts = da.bincount(mask_i.ravel()).compute()
+        return np.asarray(counts, dtype=np.int64)
+
+    mask_np = np.asarray(mask_i)
+    return np.asarray(np.bincount(mask_np.ravel()), dtype=np.int64)
+
+
+def _compute_max_label(mask: Any) -> int:
+    if _is_dask_array(mask):
+        return int(da.max(mask).compute())
+    return int(np.max(mask))
 
 class RegionAnnotationWidget:
-    def __init__(self, viewer: napari.Viewer, sdata: sd.SpatialData, image_name: str, img_shape: tuple):
+    def __init__(
+        self,
+        viewer: napari.Viewer,
+        sdata: sd.SpatialData,
+        image_name: str,
+        img_shape: tuple[int, int],
+    ):
         self.viewer = viewer
         self.sdata = sdata
         self.image_name = image_name
@@ -20,11 +121,18 @@ class RegionAnnotationWidget:
         
         if existing_regions:
             print("Loading existing tissue regions...")
-            # Load existing mask using SpatialData API
-            existing_mask = np.array(sd.get_pyramid_levels(sdata.labels['tissue_regions'], n=0)).squeeze()
-            
-            # Find the max region ID
-            self.current_region_id = int(np.max(existing_mask))
+            # Load existing mask lazily from the pyramid.
+            existing_mask = sd.get_pyramid_levels(
+                sdata.labels["tissue_regions"], n=0
+            ).squeeze()
+            existing_mask = _extract_data(existing_mask)
+
+            # Find the max region ID (reduction only, avoids materializing mask).
+            self.current_region_id = (
+                int(da.max(existing_mask).compute())
+                if _is_dask_array(existing_mask)
+                else int(np.max(existing_mask))
+            )
             
             # Load existing annotations if they exist
             if 'tissue_regions_table' in sdata.tables:
@@ -40,28 +148,49 @@ class RegionAnnotationWidget:
                 print(f"Loaded {len(self.annotations)} existing annotations")
             
             # Create labels layer with existing data
-            self.regions_layer = self.viewer.add_labels(
-                existing_mask,
-                name='tissue_regions'
-            )
+            try:
+                self.regions_layer = self.viewer.add_labels(
+                    existing_mask,
+                    name="tissue_regions",
+                )
+            except Exception:
+                # Fallback: some Napari configurations may not accept dask-backed
+                # editable label arrays. This keeps functionality working, but
+                # may use more memory.
+                self.regions_layer = self.viewer.add_labels(
+                    np.asarray(existing_mask),
+                    name="tissue_regions",
+                )
         else:
             print("Starting fresh annotations...")
             self.current_region_id = 1
-            # Create empty labels layer
-            self.regions_layer = self.viewer.add_labels(
-                np.zeros(img_shape, dtype=np.int32),
-                name='tissue_regions'
-            )
+            # Create empty labels layer lazily.
+            chunks = (min(1024, img_shape[0]), min(1024, img_shape[1]))
+            empty_mask = da.zeros(img_shape, dtype=np.int32, chunks=chunks)
+            try:
+                self.regions_layer = self.viewer.add_labels(
+                    empty_mask,
+                    name="tissue_regions",
+                )
+            except Exception:
+                self.regions_layer = self.viewer.add_labels(
+                    np.zeros(img_shape, dtype=np.int32),
+                    name="tissue_regions",
+                )
         
         # Optionally load existing cell segmentation for reference
         if 'instanseg_cell' in sdata.labels:
             try:
-                cell_data = np.array(sd.get_pyramid_levels(sdata.labels['instanseg_cell'], n=0)).squeeze()
-                self.viewer.add_labels(
+                cell_data = sd.get_pyramid_levels(
+                    sdata.labels["instanseg_cell"], n=0
+                ).squeeze()
+                cell_data = _extract_data(cell_data)
+                cell_layer = self.viewer.add_labels(
                     cell_data,
-                    name='cells',
-                    opacity=0.3
+                    name="cells",
+                    opacity=0.3,
                 )
+                cell_layer.editable = False
             except Exception as e:
                 print(f"Could not load cell segmentation: {e}")
         
@@ -69,6 +198,28 @@ class RegionAnnotationWidget:
         self.regions_layer.selected_label = self.current_region_id
         
         self._create_widget()
+
+    def _compute_max_mask_label(self) -> int:
+        mask_data = self.regions_layer.data
+        return _compute_max_label(mask_data)
+
+    def _compute_present_mask_labels(self) -> np.ndarray:
+        """Return sorted label IDs (excluding background=0) that are present."""
+        mask_data = self.regions_layer.data
+        counts = _compute_label_counts(mask_data)
+        present = np.nonzero(counts)[0]
+        present = present[present != 0]
+        return np.sort(present.astype(int))
+
+    def _region_exists_in_mask(self, region_id: int) -> bool:
+        mask_data = self.regions_layer.data
+        if _is_dask_array(mask_data):
+            return bool(da.any(mask_data == region_id).compute())
+        return bool(np.any(mask_data == region_id))
+
+    def _compute_mask_label_counts(self) -> np.ndarray:
+        """Per-label pixel counts indexed by label_id."""
+        return _compute_label_counts(self.regions_layer.data)
         
     def _create_widget(self):
         @magicgui(
@@ -107,16 +258,10 @@ class RegionAnnotationWidget:
         @magicgui(call_button="New Region (Next ID)")
         def new_region_widget():
             """Create a new region with next available ID"""
-            # Find the next available ID
-            mask_data = self.regions_layer.data
-            existing_ids = set(np.unique(mask_data))
-            existing_ids.update(self.annotations.keys())
-            existing_ids.discard(0)  # Remove background
-            
-            if len(existing_ids) == 0:
-                self.current_region_id = 1
-            else:
-                self.current_region_id = max(existing_ids) + 1
+            max_mask_label = self._compute_max_mask_label()
+            max_ann_label = max(self.annotations.keys()) if self.annotations else 0
+            max_existing = max(max_mask_label, max_ann_label)
+            self.current_region_id = 1 if max_existing <= 0 else max_existing + 1
             
             self.regions_layer.selected_label = self.current_region_id
             print(f"Started new region: {self.current_region_id}")
@@ -148,9 +293,7 @@ class RegionAnnotationWidget:
         @magicgui(call_button="List All Regions")
         def list_regions_widget():
             """Show all existing regions"""
-            mask_data = self.regions_layer.data
-            mask_ids = set(np.unique(mask_data))
-            mask_ids.discard(0)
+            mask_ids = set(self._compute_present_mask_labels().tolist())
             
             annotated_ids = set(self.annotations.keys())
             all_ids = mask_ids.union(annotated_ids)
@@ -184,9 +327,22 @@ class RegionAnnotationWidget:
             """Delete a region and its annotation"""
             # Remove from mask
             mask_data = self.regions_layer.data
-            if region_id in np.unique(mask_data):
-                mask_data[mask_data == region_id] = 0
-                self.regions_layer.data = mask_data
+            was_in_mask = self._region_exists_in_mask(region_id)
+            if was_in_mask:
+                if _is_dask_array(mask_data):
+                    try:
+                        self.regions_layer.data = da.where(
+                            mask_data == region_id, 0, mask_data
+                        )
+                    except Exception:
+                        # Fallback to an in-memory numpy update.
+                        mask_np = np.asarray(mask_data)
+                        mask_np[mask_np == region_id] = 0
+                        self.regions_layer.data = mask_np
+                else:
+                    mask_np = np.array(mask_data, copy=True)
+                    mask_np[mask_np == region_id] = 0
+                    self.regions_layer.data = mask_np
                 print(f"Removed region {region_id} from mask")
             
             # Remove annotation
@@ -194,7 +350,7 @@ class RegionAnnotationWidget:
                 del self.annotations[region_id]
                 print(f"Deleted annotation for region {region_id}")
             
-            if region_id not in np.unique(mask_data) and region_id not in self.annotations:
+            if region_id not in self.annotations:
                 print(f"Region {region_id} fully deleted")
         
         @magicgui(call_button="Save Regions to SpatialData")
@@ -204,20 +360,20 @@ class RegionAnnotationWidget:
                 print("No annotations to save!")
                 return
             
-            mask_data = self.regions_layer.data.copy()  # Make a copy so we can modify it
-            
-            # Always set pixel (0,0) to region 0 as background
-            mask_data[0, 0] = 0
-            
-            unique_labels = np.unique(mask_data)
+            mask_data = _ensure_background_pixel_zero(self.regions_layer.data)
+
+            label_counts = _compute_label_counts(mask_data)
+            unique_labels = np.nonzero(label_counts)[0]
             unique_labels = unique_labels[unique_labels != 0]
-            
-            if len(unique_labels) == 0:
+
+            if unique_labels.size == 0:
                 print("No regions drawn!")
                 return
             
             # Warn about regions without annotations
-            unannotated = [int(label_id) for label_id in unique_labels if label_id not in self.annotations]
+            unannotated = [
+                int(label_id) for label_id in unique_labels if int(label_id) not in self.annotations
+            ]
             if unannotated:
                 print(f"⚠️  Warning: Regions {unannotated} have masks but no annotations")
             
@@ -303,20 +459,22 @@ class RegionAnnotationWidget:
             
             # Now add all painted regions (1, 2, 3, ...)
             for label_id in sorted(unique_labels):
-            
-                mask = mask_data == label_id
-                area = np.sum(mask)
+
+                label_id_int = int(label_id)
+                area = int(label_counts[label_id_int])
                 
                 # Check if this region exists in existing table
                 existing_row = None
                 if existing_table is not None:
-                    existing_rows = existing_table.obs[existing_table.obs['region_id'] == label_id]
+                    existing_rows = existing_table.obs[
+                        existing_table.obs["region_id"] == label_id_int
+                    ]
                     if len(existing_rows) > 0:
                         existing_row = existing_rows.iloc[0]
                 
                 # Use annotation if available, otherwise check existing table, otherwise defaults to Unknown
-                if label_id in self.annotations:
-                    ann = self.annotations[label_id]
+                if label_id_int in self.annotations:
+                    ann = self.annotations[label_id_int]
                 elif existing_row is not None:
                     ann = {
                         'tissue_type': existing_row.get('tissue_type', 'Unknown'),
@@ -332,7 +490,7 @@ class RegionAnnotationWidget:
                     }
                 
                 obs_data.append({
-                    'region_id': int(label_id),
+                    'region_id': label_id_int,
                     'area': area,
                     'tissue_type': ann['tissue_type'],
                     'phenotype': ann['phenotype'],
@@ -447,32 +605,31 @@ def launch_region_annotation(sdata_path, auto_backup=True):
         'CD45': 'red'
     }
     
-    # Load all images
-    print("Loading channels:")
-    for img_name in sdata.images.keys():
-        print(f"  - {img_name}")
-        
-        # Get the image data using SpatialData API
-        img_data = np.array(sd.get_pyramid_levels(sdata.images[img_name], n=0)).squeeze()
-        
-        # If there's a channel dimension and it's size 1, squeeze it out
-        if img_data.ndim == 3 and img_data.shape[0] == 1:
-            img_data = img_data[0]
-        
-        viewer.add_image(
-            img_data,
-            name=img_name,
-            colormap=colormaps.get(img_name, 'gray'),
-            blending='additive',
-            visible=(img_name == 'DAPI')
-        )
-    
-    # Use first image for shape reference
+    # Use the first image for shape reference (no full materialization).
     ref_image_name = list(sdata.images.keys())[0]
-    ref_img_data = np.array(sd.get_pyramid_levels(sdata.images[ref_image_name], n=0)).squeeze()
+    ref_levels = _datatree_to_dask_levels(sdata.images[ref_image_name])
+    ref_img_data = ref_levels[0].squeeze()
     if ref_img_data.ndim == 3 and ref_img_data.shape[0] == 1:
         ref_img_data = ref_img_data[0]
     img_shape = ref_img_data.shape  # (y, x)
+
+    # Load all images lazily at multiple pyramid levels.
+    print("Loading channels:")
+    for img_name in sdata.images.keys():
+        print(f"  - {img_name}")
+        levels = _datatree_to_dask_levels(sdata.images[img_name])
+        levels = [lvl.squeeze() for lvl in levels]
+        levels = [
+            (lvl[0] if lvl.ndim == 3 and lvl.shape[0] == 1 else lvl) for lvl in levels
+        ]
+
+        viewer.add_image(
+            levels,
+            name=img_name,
+            colormap=colormaps.get(img_name, "gray"),
+            blending="additive",
+            visible=(img_name == "DAPI"),
+        )
     
     # Now create the widget with the correct shape
     widget = RegionAnnotationWidget(viewer, sdata, ref_image_name, img_shape)
@@ -557,16 +714,14 @@ def export_regions_to_spatialdata(sdata, mask_data, annotations, image_name,
     SpatialData
         Updated SpatialData object
     """
-    unique_labels = np.unique(mask_data)
+    mask_data = _ensure_background_pixel_zero(mask_data)
+    label_counts = _compute_label_counts(mask_data)
+    unique_labels = np.nonzero(label_counts)[0]
     unique_labels = unique_labels[unique_labels != 0]
-    
-    if len(unique_labels) == 0:
+
+    if unique_labels.size == 0:
         print("No regions to export!")
         return sdata
-    
-    # Always set pixel (0,0) to region 0 as background
-    mask_data = mask_data.copy()
-    mask_data[0, 0] = 0
     
     # Preserve existing transformations and attributes for labels
     transformations = None
@@ -627,18 +782,20 @@ def export_regions_to_spatialdata(sdata, mask_data, annotations, image_name,
     
     # Now add all actual painted regions
     for label_id in sorted(unique_labels):
-    
-        mask = mask_data == label_id
-        area = np.sum(mask)
+
+        label_id_int = int(label_id)
+        area = int(label_counts[label_id_int])
         
         existing_row = None
         if existing_table is not None:
-            existing_rows = existing_table.obs[existing_table.obs['region_id'] == label_id]
+            existing_rows = existing_table.obs[
+                existing_table.obs["region_id"] == label_id_int
+            ]
             if len(existing_rows) > 0:
                 existing_row = existing_rows.iloc[0]
         
-        if label_id in annotations:
-            ann = annotations[label_id]
+        if label_id_int in annotations:
+            ann = annotations[label_id_int]
         elif existing_row is not None:
             ann = {
                 'tissue_type': existing_row.get('tissue_type', 'Unknown'),
@@ -653,7 +810,7 @@ def export_regions_to_spatialdata(sdata, mask_data, annotations, image_name,
             }
         
         obs_data.append({
-            'region_id': int(label_id),
+            'region_id': label_id_int,
             'area': area,
             'tissue_type': ann['tissue_type'],
             'phenotype': ann['phenotype'],
