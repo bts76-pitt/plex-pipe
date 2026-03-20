@@ -10,7 +10,10 @@ Usage:
     python annotate_regions.py /path/to/Core_000.zarr --link-cells
 
     # List all available cores and pick one interactively:
-    python annotate_regions.py --core-dir /path/to/cores/
+    python annotate_regions.py --core-dir /path/to/Lee-Oesterreich/
+
+    # Only load specific channels (faster startup, less memory):
+    python annotate_regions.py /path/to/Core_000.zarr --channels DAPI CK818 CK14 ECad
 
     # Batch link cells to regions for all annotated cores (no napari):
     python annotate_regions.py --core-dir /path/to/cores/ --link-cells-only
@@ -25,35 +28,74 @@ import spatialdata as sd
 
 
 def list_cores(core_dir: Path) -> list[Path]:
-    """List all .zarr core directories, sorted."""
-    cores = sorted(
+    """List all .zarr core/ROI directories, searching common PlexPipe layouts.
+
+    Handles both structures:
+        <Analysis>/sdata/cores/Core_XXX.zarr
+        <Analysis>/rois/ROI_XXX.zarr
+
+    If core_dir points directly to a cores/ or rois/ folder, lists its contents.
+    If core_dir points to an Analysis folder, searches for sdata/cores/ and rois/.
+    If core_dir is a parent of multiple Analysis folders, searches all of them.
+    """
+    zarr_dirs: list[Path] = []
+
+    # Case 1: core_dir itself contains .zarr directories
+    local_zarrs = sorted(
         p for p in core_dir.iterdir()
         if p.is_dir() and not p.name.startswith(".") and p.suffix == ".zarr"
     )
-    return cores
+    if local_zarrs:
+        zarr_dirs.extend(local_zarrs)
+        return sorted(set(zarr_dirs), key=lambda p: p.name)
+
+    # Case 2: core_dir is an Analysis folder or parent -- search recursively
+    search_patterns = [
+        "sdata/cores",
+        "rois",
+        "*/sdata/cores",
+        "*/rois",
+    ]
+    for pattern in search_patterns:
+        for subdir in sorted(core_dir.glob(pattern)):
+            if not subdir.is_dir():
+                continue
+            for p in sorted(subdir.iterdir()):
+                if p.is_dir() and not p.name.startswith(".") and p.suffix == ".zarr":
+                    zarr_dirs.append(p)
+
+    return sorted(set(zarr_dirs), key=lambda p: str(p))
 
 
 def pick_core(core_dir: Path) -> Path:
     """Interactive core selection."""
     cores = list_cores(core_dir)
     if not cores:
-        print(f"No .zarr directories found in {core_dir}")
+        print(f"No .zarr directories found in or under {core_dir}")
         sys.exit(1)
 
-    print(f"\nAvailable cores in {core_dir}:\n")
+    print(f"\nAvailable cores/ROIs (searched from {core_dir}):\n")
     for i, core in enumerate(cores):
+        # Show the parent context so you know which sample it's from
+        try:
+            rel = core.relative_to(core_dir)
+        except ValueError:
+            rel = core.name
+
         # Check if it already has tissue_regions
         has_annotations = ""
         try:
             sdata = sd.read_zarr(core)
             if "tissue_regions" in sdata.labels:
-                n_regions = len(sdata.tables.get("tissue_regions_table", {}).obs) - 1 if "tissue_regions_table" in sdata.tables else "?"
+                n_regions = "?"
+                if "tissue_regions_table" in sdata.tables:
+                    n_regions = len(sdata.tables["tissue_regions_table"].obs) - 1
                 has_annotations = f"  [annotated, {n_regions} regions]"
             del sdata
         except Exception:
             has_annotations = "  [could not read]"
 
-        print(f"  {i + 1}. {core.name}{has_annotations}")
+        print(f"  {i + 1}. {rel}{has_annotations}")
 
     while True:
         choice = input(f"\nSelect core (1-{len(cores)}): ").strip()
@@ -66,7 +108,7 @@ def pick_core(core_dir: Path) -> Path:
         print("Invalid selection, try again.")
 
 
-def annotate_core(sd_path: Path, link_cells: bool = False):
+def annotate_core(sd_path: Path, link_cells: bool = False, channels: list[str] | None = None):
     """Open napari for annotation, then optionally link cells."""
     from plex_pipe.ui.region_annotator import launch_region_annotation, link_cells_to_regions
 
@@ -83,7 +125,7 @@ def annotate_core(sd_path: Path, link_cells: bool = False):
 
     # Launch napari (blocks until window is closed)
     # The save dialog runs automatically after closing napari
-    sdata, widget = launch_region_annotation(str(sd_path))
+    sdata, widget = launch_region_annotation(str(sd_path), channels=channels)
 
     # Optionally link cells to regions
     if link_cells and "instanseg_cell" in sdata.labels and "tissue_regions" in sdata.labels:
@@ -126,9 +168,14 @@ def batch_link_cells(core_dir: Path):
 
     for core_path in cores:
         try:
+            rel = core_path.relative_to(core_dir)
+        except ValueError:
+            rel = core_path.name
+
+        try:
             sdata = sd.read_zarr(core_path)
         except Exception as e:
-            print(f"  {core_path.name}: could not read ({e})")
+            print(f"  {rel}: could not read ({e})")
             continue
 
         has_regions = "tissue_regions" in sdata.labels
@@ -136,18 +183,18 @@ def batch_link_cells(core_dir: Path):
         has_table = "instanseg_table" in sdata.tables
 
         if not has_regions:
-            print(f"  {core_path.name}: no tissue regions, skipping")
+            print(f"  {rel}: no tissue regions, skipping")
             continue
         if not has_cells or not has_table:
-            print(f"  {core_path.name}: no cell segmentation/table, skipping")
+            print(f"  {rel}: no cell segmentation/table, skipping")
             continue
 
         # Check if already linked
         if "region_tissue_type" in sdata.tables["instanseg_table"].obs.columns:
-            print(f"  {core_path.name}: already linked, skipping")
+            print(f"  {rel}: already linked, skipping")
             continue
 
-        print(f"  {core_path.name}: linking cells to regions...")
+        print(f"  {rel}: linking cells to regions...")
         sdata = link_cells_to_regions(
             sdata=sdata,
             cell_labels_name="instanseg_cell",
@@ -178,7 +225,13 @@ def main():
         "--core-dir",
         type=Path,
         default=None,
-        help="Directory containing .zarr cores (for interactive selection or batch ops)",
+        help="Directory containing .zarr cores, or parent Analysis directory",
+    )
+    parser.add_argument(
+        "--channels",
+        nargs="+",
+        default=None,
+        help="Only load these image channels (e.g. --channels DAPI CK818 CK14 ECad)",
     )
     parser.add_argument(
         "--link-cells",
@@ -209,7 +262,7 @@ def main():
     else:
         # Default path
         default_dir = Path(
-            "/Volumes/HSIT-Stallaert-Lab/data_analysis/Lee-Oesterreich/NSR7649_Analysis/sdata/cores"
+            "/Volumes/HSIT-Stallaert-Lab/data_analysis/Lee-Oesterreich"
         )
         if default_dir.exists():
             sd_path = pick_core(default_dir)
@@ -222,7 +275,7 @@ def main():
         print(f"Path does not exist: {sd_path}")
         sys.exit(1)
 
-    annotate_core(sd_path, link_cells=args.link_cells)
+    annotate_core(sd_path, link_cells=args.link_cells, channels=args.channels)
 
 
 if __name__ == "__main__":
