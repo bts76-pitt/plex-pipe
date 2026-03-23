@@ -712,22 +712,45 @@ def launch_region_annotation(sdata_path, auto_backup=True, channels=None, downsa
         "Choice (1-4): "
     )
 
+    def _normalize_sdata_chunks(sdata_obj):
+        """Rechunk all image elements to uniform chunk sizes before writing.
+
+        zarr v3 requires regular (uniform) chunk grids. Dask arrays loaded
+        from existing zarr stores can have irregular trailing chunks, which
+        causes ``TypeError: Expected an iterable of integers`` on write.
+        """
+        for img_name in list(sdata_obj.images.keys()):
+            element = sdata_obj.images[img_name]
+            # Walk the DataTree and rechunk each variable.
+            for node_name, node in element.items():
+                for var_name, var in node.data_vars.items():
+                    data = var.data
+                    if _is_dask_array(data):
+                        # Use the first chunk size per dimension as the
+                        # uniform chunk size (handles trailing remainders).
+                        uniform = tuple(c[0] for c in data.chunks)
+                        data = data.rechunk(uniform)
+                        node[var_name] = var.copy(data=data)
+
+    save_path = None
     if save_choice == "1":
-        sdata.write(suggested_path)
-        print(f"Saved to {suggested_path}")
+        save_path = suggested_path
     elif save_choice == "2":
         confirm = input(f"Really overwrite {original_path}? Type 'yes' to confirm: ")
         if confirm == "yes":
-            sdata.write(original_path)
-            print(f"Saved to {original_path}")
+            save_path = original_path
         else:
             print("Save cancelled")
     elif save_choice == "3":
-        custom_path = Path(input("Enter path: "))
-        if not custom_path.is_absolute():
-            custom_path = original_path.parent / custom_path
-        sdata.write(custom_path)
-        print(f"Saved to {custom_path}")
+        save_path = Path(input("Enter path: "))
+        if not save_path.is_absolute():
+            save_path = original_path.parent / save_path
+
+    if save_path is not None:
+        print("Normalizing chunks for zarr write...")
+        _normalize_sdata_chunks(sdata)
+        sdata.write(save_path)
+        print(f"Saved to {save_path}")
     else:
         print("Changes not saved to disk")
 
