@@ -6,6 +6,7 @@ import dask.array as da
 import pandas as pd
 from spatialdata.models import Labels2DModel, TableModel
 import anndata as ad
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +152,35 @@ def _compute_max_label(mask: Any) -> int:
     if _is_dask_array(mask):
         return int(da.max(mask).compute())
     return int(np.max(mask))
+
+
+def _persist_annotation_elements(
+    sdata_obj: sd.SpatialData,
+    original_path: Path,
+    save_path: Path,
+) -> None:
+    """Persist annotation elements without rewriting image pyramids.
+
+    Writing full ``SpatialData`` can fail on some zarr-v3 stacks when image
+    chunk metadata is inherited from existing stores. This routine copies the
+    source store (for new output paths) and writes only labels/tables changed
+    by this annotator.
+    """
+    original_path = Path(original_path)
+    save_path = Path(save_path)
+
+    if save_path.resolve() != original_path.resolve():
+        shutil.copytree(original_path, save_path, dirs_exist_ok=True)
+
+    target = sd.read_zarr(save_path)
+
+    if "tissue_regions" in sdata_obj.labels:
+        target.labels["tissue_regions"] = sdata_obj.labels["tissue_regions"]
+        target.write_element("tissue_regions", overwrite=True)
+
+    if "tissue_regions_table" in sdata_obj.tables:
+        target.tables["tissue_regions_table"] = sdata_obj.tables["tissue_regions_table"]
+        target.write_element("tissue_regions_table", overwrite=True)
 
 
 # ---------------------------------------------------------------------------
@@ -713,24 +743,44 @@ def launch_region_annotation(sdata_path, auto_backup=True, channels=None, downsa
     )
 
     def _normalize_sdata_chunks(sdata_obj):
-        """Rechunk all image elements to uniform chunk sizes before writing.
+        """Normalize image chunk metadata and chunking for zarr-v3 writes.
 
-        zarr v3 requires regular (uniform) chunk grids. Dask arrays loaded
-        from existing zarr stores can have irregular trailing chunks, which
-        causes ``TypeError: Expected an iterable of integers`` on write.
+        Some inputs carry xarray encodings where ``encoding["chunks"]`` is a
+        Dask block structure (tuple-of-tuples) instead of a chunk-shape tuple.
+        zarr v3 rejects this with ``Expected an iterable of integers``.
         """
         for img_name in list(sdata_obj.images.keys()):
             element = sdata_obj.images[img_name]
             # Walk the DataTree and rechunk each variable.
-            for node_name, node in element.items():
-                for var_name, var in node.data_vars.items():
+            for _, node in element.items():
+                for var_name, var in list(node.data_vars.items()):
                     data = var.data
+                    new_var = var
                     if _is_dask_array(data):
-                        # Use the first chunk size per dimension as the
-                        # uniform chunk size (handles trailing remainders).
-                        uniform = tuple(c[0] for c in data.chunks)
+                        # Convert to canonical chunk-shape tuple of integers.
+                        # Keep chunks <= axis length and avoid irregular grids.
+                        uniform = tuple(
+                            int(max(1, min(cs, sh)))
+                            for cs, sh in zip(data.chunksize, data.shape)
+                        )
                         data = data.rechunk(uniform)
-                        node[var_name] = var.copy(data=data)
+                        new_var = var.copy(data=data)
+                        # Remove stale/invalid chunk metadata and write a
+                        # canonical integer chunk shape expected by zarr v3.
+                        if hasattr(new_var, "encoding"):
+                            old_enc = dict(getattr(new_var, "encoding", {}))
+                            old_enc.pop("chunks", None)
+                            old_enc.pop("preferred_chunks", None)
+                            old_enc["chunks"] = uniform
+                            new_var.encoding = old_enc
+                    elif hasattr(new_var, "encoding"):
+                        # Non-dask payloads can still carry invalid chunks from
+                        # source metadata; drop them and let writer choose.
+                        old_enc = dict(getattr(new_var, "encoding", {}))
+                        old_enc.pop("chunks", None)
+                        old_enc.pop("preferred_chunks", None)
+                        new_var.encoding = old_enc
+                    node[var_name] = new_var
 
     save_path = None
     if save_choice == "1":
@@ -747,9 +797,13 @@ def launch_region_annotation(sdata_path, auto_backup=True, channels=None, downsa
             save_path = original_path.parent / save_path
 
     if save_path is not None:
-        print("Normalizing chunks for zarr write...")
+        print("Saving annotations without rewriting image pyramids...")
         _normalize_sdata_chunks(sdata)
-        sdata.write(save_path)
+        _persist_annotation_elements(
+            sdata_obj=sdata,
+            original_path=original_path,
+            save_path=Path(save_path),
+        )
         print(f"Saved to {save_path}")
     else:
         print("Changes not saved to disk")
@@ -775,7 +829,11 @@ def save_annotations(sdata, sdata_path, auto_backup=True):
     else:
         save_path = original_path
 
-    sdata.write(save_path)
+    _persist_annotation_elements(
+        sdata_obj=sdata,
+        original_path=original_path,
+        save_path=save_path,
+    )
     print(f"Saved to {save_path}")
 
 
