@@ -10,10 +10,13 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from plex_pipe.io.spatialdata_zarr import read_spatialdata_zarr
+
 
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_dask_array(x: Any) -> bool:
     return isinstance(x, da.Array)
@@ -229,7 +232,7 @@ def _persist_annotation_elements(
 
     write_kw = _write_element_kwargs_for_zarr_root(save_path)
 
-    target = sd.read_zarr(save_path)
+    target = read_spatialdata_zarr(save_path)
 
     if "tissue_regions" in sdata_obj.labels:
         target.labels["tissue_regions"] = sdata_obj.labels["tissue_regions"]
@@ -254,7 +257,7 @@ def sync_spatialdata_to_store(
     """
     store_path = Path(store_path)
     write_kw = _write_element_kwargs_for_zarr_root(store_path)
-    target = sd.read_zarr(store_path)
+    target = read_spatialdata_zarr(store_path)
     for name in labels:
         if name not in sdata_obj.labels:
             raise KeyError(f"Label {name!r} not in in-memory SpatialData")
@@ -720,7 +723,13 @@ def launch_region_annotation(sdata_path, auto_backup=True, channels=None, downsa
     widget : RegionAnnotationWidget
         The annotation widget (useful for programmatic access in notebooks).
     """
-    sdata = sd.read_zarr(sdata_path)
+    sdata = read_spatialdata_zarr(sdata_path)
+    if not sdata.images:
+        raise ValueError(
+            f"No readable image layers in {sdata_path!s}. The zarr store may be badly corrupted "
+            "(e.g. interrupted write). Try opening the original core, or remove broken subgroups under "
+            "`images/` or `labels/` that lack OME-Zarr multiscales metadata."
+        )
     viewer = napari.Viewer()
 
     colormaps = {

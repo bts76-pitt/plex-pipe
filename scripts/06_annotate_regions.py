@@ -21,10 +21,13 @@ Usage:
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
 import spatialdata as sd
+
+from plex_pipe.io.spatialdata_zarr import read_spatialdata_zarr
 
 
 def list_cores(core_dir: Path) -> list[Path]:
@@ -85,7 +88,7 @@ def pick_core(core_dir: Path) -> Path:
         # Check if it already has tissue_regions
         has_annotations = ""
         try:
-            sdata = sd.read_zarr(core)
+            sdata = read_spatialdata_zarr(core)
             if "tissue_regions" in sdata.labels:
                 n_regions = "?"
                 if "tissue_regions_table" in sdata.tables:
@@ -110,12 +113,31 @@ def pick_core(core_dir: Path) -> Path:
 
 def annotate_core(sd_path: Path, link_cells: bool = False, channels: list[str] | None = None):
     """Open napari for annotation, then optionally link cells."""
-    from plex_pipe.ui.region_annotator import launch_region_annotation, link_cells_to_regions
+    from plex_pipe.ui.region_annotator import (
+        launch_region_annotation,
+        link_cells_to_regions,
+        sync_spatialdata_to_store,
+        zarr_store_copy_ignore,
+    )
 
     print(f"\nWorking on: {sd_path}")
 
-    # Check what's available
-    sdata_check = sd.read_zarr(sd_path)
+    # Check what's available (skip broken raster subgroups from interrupted saves)
+    sdata_check = read_spatialdata_zarr(sd_path)
+    if not sdata_check.images:
+        print(
+            "ERROR: No readable image layers in this zarr. The store may be corrupted "
+            "(e.g. incomplete write). Try the original core, or remove broken groups "
+            "under images/ or labels/ that lack OME-Zarr metadata.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if "annotated" in sd_path.name.lower() and "tissue_regions" not in sdata_check.labels:
+        print(
+            "\nNote: No readable `tissue_regions` layer in this file (common after a failed "
+            "save). Images loaded; you can annotate again. To clean up: delete "
+            "`labels/tissue_regions` inside the .zarr, or re-copy from the source core.\n"
+        )
     print(f"Available images: {list(sdata_check.images.keys())}")
     if "tissue_regions" in sdata_check.labels:
         print("Existing tissue regions found (will be loaded for editing)")
@@ -153,7 +175,16 @@ def annotate_core(sd_path: Path, link_cells: bool = False, channels: list[str] |
                 if confirm != "y":
                     print("Skipped saving cell linkage.")
                     return sdata
-            sdata.write(out_path, overwrite=True)
+                shutil.rmtree(out_path)
+            # Avoid full ``sdata.write`` (rewrites images; breaks Zarr v2 vs NGFF 0.5 mismatch).
+            shutil.copytree(sd_path, out_path, ignore=zarr_store_copy_ignore)
+            labels = ("tissue_regions",) if "tissue_regions" in sdata.labels else ()
+            tables = tuple(
+                t
+                for t in ("tissue_regions_table", "instanseg_table")
+                if t in sdata.tables
+            )
+            sync_spatialdata_to_store(sdata, out_path, labels=labels, tables=tables)
             print(f"Saved to {out_path}")
 
     return sdata
@@ -161,7 +192,7 @@ def annotate_core(sd_path: Path, link_cells: bool = False, channels: list[str] |
 
 def batch_link_cells(core_dir: Path):
     """Link cells to regions for all cores that have both annotations and segmentation."""
-    from plex_pipe.ui.region_annotator import link_cells_to_regions
+    from plex_pipe.ui.region_annotator import link_cells_to_regions, sync_spatialdata_to_store, zarr_store_copy_ignore
 
     cores = list_cores(core_dir)
     print(f"\nScanning {len(cores)} cores for cell linkage...\n")
@@ -173,7 +204,7 @@ def batch_link_cells(core_dir: Path):
             rel = core_path.name
 
         try:
-            sdata = sd.read_zarr(core_path)
+            sdata = read_spatialdata_zarr(core_path)
         except Exception as e:
             print(f"  {rel}: could not read ({e})")
             continue
@@ -203,7 +234,10 @@ def batch_link_cells(core_dir: Path):
         )
 
         out_path = core_path.parent / f"{core_path.stem}_linked.zarr"
-        sdata.write(out_path, overwrite=True)
+        if out_path.exists():
+            shutil.rmtree(out_path)
+        shutil.copytree(core_path, out_path, ignore=zarr_store_copy_ignore)
+        sync_spatialdata_to_store(sdata, out_path, tables=("instanseg_table",))
         print(f"    Saved to {out_path}")
 
     print("\nBatch linking complete.")
