@@ -154,6 +154,56 @@ def _compute_max_label(mask: Any) -> int:
     return int(np.max(mask))
 
 
+def _zarr_store_copy_ignore(_src: str, names: list[str]) -> set[str]:
+    """Skip macOS junk that breaks Zarr hierarchy readers."""
+    return {n for n in names if n == ".DS_Store" or n.startswith("._")}
+
+
+# Used by CLI scripts that ``copytree`` zarr stores before partial writes.
+zarr_store_copy_ignore = _zarr_store_copy_ignore
+
+
+def _root_zarr_major_version(store_path: Path) -> int | None:
+    """Return 2 or 3 for the on-disk Zarr *root* layout, or None if unknown.
+
+    SpatialData stores are either legacy Zarr v2 (``.zgroup``) or Zarr v3
+    (``zarr.json`` at the store root). Writers must use matching OME-NGFF /
+    SpatialData raster formats: v2 roots need ``RasterFormatV02`` (NGFF 0.4),
+    v3 roots use the current default (NGFF 0.5).
+    """
+    store_path = Path(store_path)
+    if (store_path / "zarr.json").exists():
+        return 3
+    if (store_path / ".zgroup").exists():
+        return 2
+    return None
+
+
+def _write_element_kwargs_for_zarr_root(store_path: Path) -> dict[str, Any]:
+    """Keyword args for ``SpatialData.write_element`` matching store Zarr version."""
+    major = _root_zarr_major_version(store_path)
+    if major != 2:
+        return {}
+
+    try:
+        from spatialdata._io.format import (
+            RasterFormatV02,
+            SpatialDataContainerFormatV01,
+            TablesFormatV01,
+        )
+    except ImportError:
+        return {}
+
+    # Zarr v2 root: must not use default NGFF 0.5 / RasterFormatV03 writer.
+    return {
+        "sdata_formats": [
+            SpatialDataContainerFormatV01(),
+            RasterFormatV02(),
+            TablesFormatV01(),
+        ],
+    }
+
+
 def _persist_annotation_elements(
     sdata_obj: sd.SpatialData,
     original_path: Path,
@@ -170,17 +220,51 @@ def _persist_annotation_elements(
     save_path = Path(save_path)
 
     if save_path.resolve() != original_path.resolve():
-        shutil.copytree(original_path, save_path, dirs_exist_ok=True)
+        shutil.copytree(
+            original_path,
+            save_path,
+            dirs_exist_ok=True,
+            ignore=_zarr_store_copy_ignore,
+        )
+
+    write_kw = _write_element_kwargs_for_zarr_root(save_path)
 
     target = sd.read_zarr(save_path)
 
     if "tissue_regions" in sdata_obj.labels:
         target.labels["tissue_regions"] = sdata_obj.labels["tissue_regions"]
-        target.write_element("tissue_regions", overwrite=True)
+        target.write_element("tissue_regions", overwrite=True, **write_kw)
 
     if "tissue_regions_table" in sdata_obj.tables:
         target.tables["tissue_regions_table"] = sdata_obj.tables["tissue_regions_table"]
-        target.write_element("tissue_regions_table", overwrite=True)
+        target.write_element("tissue_regions_table", overwrite=True, **write_kw)
+
+
+def sync_spatialdata_to_store(
+    sdata_obj: sd.SpatialData,
+    store_path: str | Path,
+    *,
+    labels: tuple[str, ...] = (),
+    tables: tuple[str, ...] = (),
+) -> None:
+    """Write selected labels/tables into an on-disk SpatialData zarr (no image rewrite).
+
+    Chooses NGFF / SpatialData writers compatible with Zarr v2 vs v3 *store roots*.
+    The store must already exist (e.g. after ``shutil.copytree`` from a template).
+    """
+    store_path = Path(store_path)
+    write_kw = _write_element_kwargs_for_zarr_root(store_path)
+    target = sd.read_zarr(store_path)
+    for name in labels:
+        if name not in sdata_obj.labels:
+            raise KeyError(f"Label {name!r} not in in-memory SpatialData")
+        target.labels[name] = sdata_obj.labels[name]
+        target.write_element(name, overwrite=True, **write_kw)
+    for name in tables:
+        if name not in sdata_obj.tables:
+            raise KeyError(f"Table {name!r} not in in-memory SpatialData")
+        target.tables[name] = sdata_obj.tables[name]
+        target.write_element(name, overwrite=True, **write_kw)
 
 
 # ---------------------------------------------------------------------------
