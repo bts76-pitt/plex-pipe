@@ -157,6 +157,38 @@ def _compute_max_label(mask: Any) -> int:
     return int(np.max(mask))
 
 
+def _canonicalize_chunks(chunks: Any, shape: tuple[int, ...]) -> tuple[int, ...] | None:
+    """Convert various chunk specs to a plain tuple of ints.
+
+    SpatialData elements loaded from disk can expose ``.chunks`` as a Dask block
+    structure (tuple-of-tuples). Zarr v3 requires ``chunk_shape`` to be an
+    iterable of integers, so we normalize to a simple tuple[int, ...].
+    """
+    if chunks is None:
+        return None
+    try:
+        # If it's already a tuple of ints, keep it.
+        if isinstance(chunks, tuple) and all(isinstance(c, int) for c in chunks):
+            out = chunks
+        elif isinstance(chunks, (list, tuple)):
+            out_list: list[int] = []
+            for c, sh in zip(chunks, shape, strict=False):
+                if isinstance(c, int):
+                    out_list.append(c)
+                elif isinstance(c, (list, tuple)) and len(c) > 0 and isinstance(c[0], int):
+                    # Take first block size for that axis.
+                    out_list.append(int(c[0]))
+                else:
+                    return None
+            out = tuple(out_list)
+        else:
+            return None
+        # Clamp to valid sizes.
+        return tuple(int(max(1, min(c, sh))) for c, sh in zip(out, shape, strict=False))
+    except Exception:
+        return None
+
+
 def _zarr_store_copy_ignore(_src: str, names: list[str]) -> set[str]:
     """Skip macOS junk that breaks Zarr hierarchy readers."""
     return {n for n in names if n == ".DS_Store" or n.startswith("._")}
@@ -558,7 +590,10 @@ class RegionAnnotationWidget:
                     print(f"Note: Could not copy transformations from reference image: {e}")
 
             ref_shape = mask_data.shape
-            chunks = existing_chunks or (min(1024, ref_shape[0]), min(1024, ref_shape[1]))
+            chunks = _canonicalize_chunks(existing_chunks, ref_shape) or (
+                min(1024, ref_shape[0]),
+                min(1024, ref_shape[1]),
+            )
             scale_factors = existing_scale_factors or [2, 2]
 
             labels_model = Labels2DModel.parse(
@@ -998,7 +1033,10 @@ def export_regions_to_spatialdata(
             pass
 
     ref_shape = mask_data.shape
-    chunks = existing_chunks or (min(1024, ref_shape[0]), min(1024, ref_shape[1]))
+    chunks = _canonicalize_chunks(existing_chunks, ref_shape) or (
+        min(1024, ref_shape[0]),
+        min(1024, ref_shape[1]),
+    )
     scale_factors = existing_scale_factors or [2, 2]
 
     labels_model = Labels2DModel.parse(
