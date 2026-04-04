@@ -239,6 +239,46 @@ def _write_element_kwargs_for_zarr_root(store_path: Path) -> dict[str, Any]:
     }
 
 
+def _normalize_sdata_chunks(sdata_obj: "sd.SpatialData") -> None:
+    """Normalize chunk metadata for all images and labels before zarr-v3 writes.
+
+    Some inputs carry xarray encodings where ``encoding["chunks"]`` is a
+    Dask block structure (tuple-of-tuples) instead of a chunk-shape tuple.
+    zarr v3 rejects this with ``Expected an iterable of integers``.
+    Newly created labels (from ``Labels2DModel.parse``) also carry block-structure
+    chunk metadata that must be normalized before ``write_element`` is called.
+    """
+    def _normalize_element(element: Any) -> None:
+        for _, node in element.items():
+            for var_name, var in list(node.data_vars.items()):
+                data = var.data
+                new_var = var
+                if _is_dask_array(data):
+                    uniform = tuple(
+                        int(max(1, min(cs, sh)))
+                        for cs, sh in zip(data.chunksize, data.shape)
+                    )
+                    data = data.rechunk(uniform)
+                    new_var = var.copy(data=data)
+                    if hasattr(new_var, "encoding"):
+                        old_enc = dict(getattr(new_var, "encoding", {}))
+                        old_enc.pop("chunks", None)
+                        old_enc.pop("preferred_chunks", None)
+                        old_enc["chunks"] = uniform
+                        new_var.encoding = old_enc
+                elif hasattr(new_var, "encoding"):
+                    old_enc = dict(getattr(new_var, "encoding", {}))
+                    old_enc.pop("chunks", None)
+                    old_enc.pop("preferred_chunks", None)
+                    new_var.encoding = old_enc
+                node[var_name] = new_var
+
+    for name in list(sdata_obj.images.keys()):
+        _normalize_element(sdata_obj.images[name])
+    for name in list(sdata_obj.labels.keys()):
+        _normalize_element(sdata_obj.labels[name])
+
+
 def _persist_annotation_elements(
     sdata_obj: sd.SpatialData,
     original_path: Path,
@@ -869,46 +909,6 @@ def launch_region_annotation(sdata_path, auto_backup=True, channels=None, downsa
         "  4. Don't save\n"
         "Choice (1-4): "
     )
-
-    def _normalize_sdata_chunks(sdata_obj):
-        """Normalize image chunk metadata and chunking for zarr-v3 writes.
-
-        Some inputs carry xarray encodings where ``encoding["chunks"]`` is a
-        Dask block structure (tuple-of-tuples) instead of a chunk-shape tuple.
-        zarr v3 rejects this with ``Expected an iterable of integers``.
-        """
-        for img_name in list(sdata_obj.images.keys()):
-            element = sdata_obj.images[img_name]
-            # Walk the DataTree and rechunk each variable.
-            for _, node in element.items():
-                for var_name, var in list(node.data_vars.items()):
-                    data = var.data
-                    new_var = var
-                    if _is_dask_array(data):
-                        # Convert to canonical chunk-shape tuple of integers.
-                        # Keep chunks <= axis length and avoid irregular grids.
-                        uniform = tuple(
-                            int(max(1, min(cs, sh)))
-                            for cs, sh in zip(data.chunksize, data.shape)
-                        )
-                        data = data.rechunk(uniform)
-                        new_var = var.copy(data=data)
-                        # Remove stale/invalid chunk metadata and write a
-                        # canonical integer chunk shape expected by zarr v3.
-                        if hasattr(new_var, "encoding"):
-                            old_enc = dict(getattr(new_var, "encoding", {}))
-                            old_enc.pop("chunks", None)
-                            old_enc.pop("preferred_chunks", None)
-                            old_enc["chunks"] = uniform
-                            new_var.encoding = old_enc
-                    elif hasattr(new_var, "encoding"):
-                        # Non-dask payloads can still carry invalid chunks from
-                        # source metadata; drop them and let writer choose.
-                        old_enc = dict(getattr(new_var, "encoding", {}))
-                        old_enc.pop("chunks", None)
-                        old_enc.pop("preferred_chunks", None)
-                        new_var.encoding = old_enc
-                    node[var_name] = new_var
 
     save_path = None
     if save_choice == "1":
