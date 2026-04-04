@@ -73,7 +73,7 @@ def test_persist_annotation_elements_v3(tmp_path: Path) -> None:
 
     result = read_spatialdata_zarr(dest)
     assert "tissue_regions" in result.labels
-    assert "image" in result.images
+    assert "DAPI" in result.images
 
 
 def test_persist_annotation_elements_v2(tmp_path: Path) -> None:
@@ -97,7 +97,7 @@ def test_persist_annotation_elements_v2(tmp_path: Path) -> None:
 
     result = read_spatialdata_zarr(dest)
     assert "tissue_regions" in result.labels
-    assert "image" in result.images
+    assert "DAPI" in result.images
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ def test_minimal_sdata_zarr_v3_fixture(minimal_sdata_zarr_v3: Path) -> None:
 
     assert _root_zarr_major_version(minimal_sdata_zarr_v3) == 3
     sdata = read_spatialdata_zarr(minimal_sdata_zarr_v3)
-    assert "image" in sdata.images
+    assert "DAPI" in sdata.images
     assert "tissue_regions" in sdata.labels
 
 
@@ -122,5 +122,5 @@ def test_minimal_sdata_zarr_v2_fixture(minimal_sdata_zarr_v2: Path) -> None:
         pytest.skip("zarr v2 store creation not supported in this environment")
 
     sdata = read_spatialdata_zarr(minimal_sdata_zarr_v2)
-    assert "image" in sdata.images
+    assert "DAPI" in sdata.images
     assert "tissue_regions" in sdata.labels

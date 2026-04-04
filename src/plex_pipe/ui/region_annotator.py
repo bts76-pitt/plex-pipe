@@ -279,6 +279,77 @@ def _normalize_sdata_chunks(sdata_obj: "sd.SpatialData") -> None:
         _normalize_element(sdata_obj.labels[name])
 
 
+def _write_elements_to_store(
+    sdata_obj: sd.SpatialData,
+    store_path: Path,
+    *,
+    labels: tuple[str, ...] = (),
+    tables: tuple[str, ...] = (),
+) -> None:
+    """Write labels/tables directly into an existing on-disk zarr store.
+
+    Uses spatialdata's low-level writers rather than ``SpatialData.write_element``
+    to avoid the safety check that blocks writes into a store that is already
+    open as a backing store (spatialdata/discussions/520).
+    """
+    import zarr
+    from spatialdata._io import write_labels, write_table
+    from spatialdata._io.format import _parse_formats
+
+    zarr_format_kw = _write_element_kwargs_for_zarr_root(store_path)
+    parsed = _parse_formats(formats=zarr_format_kw.get("sdata_formats"))
+    # use_consolidated=False: the store may not have a `labels` group yet in
+    # its consolidated metadata (e.g. first annotation save), so zarr would
+    # raise KeyError when require_group tries to create it.
+    root = zarr.open_group(str(store_path), mode="a", use_consolidated=False)
+
+    for name in labels:
+        if name not in sdata_obj.labels:
+            raise KeyError(f"Label {name!r} not in SpatialData")
+        # Remove existing group so write_labels can create it fresh (no overwrite flag).
+        labels_group = root.require_group("labels")
+        if name in labels_group:
+            import warnings
+            warnings.warn(
+                f"Overwriting existing label '{name}' in {store_path}",
+                UserWarning,
+                stacklevel=2,
+            )
+            del labels_group[name]
+        write_labels(
+            labels=sdata_obj.labels[name],
+            group=root,
+            name=name,
+            element_format=parsed["raster"],
+        )
+
+    for name in tables:
+        if name not in sdata_obj.tables:
+            raise KeyError(f"Table {name!r} not in SpatialData")
+        tables_group = root.require_group("tables")
+        if name in tables_group:
+            import warnings
+            warnings.warn(
+                f"Overwriting existing table '{name}' in {store_path}",
+                UserWarning,
+                stacklevel=2,
+            )
+            del tables_group[name]
+        write_table(
+            table=sdata_obj.tables[name],
+            group=tables_group,
+            name=name,
+            element_format=parsed["tables"],
+        )
+
+    # Re-consolidate zarr v3 metadata so newly written groups appear in the
+    # root zarr.json consolidated index (spatialdata reads use it exclusively).
+    try:
+        zarr.consolidate_metadata(root.store)
+    except Exception:
+        pass  # v2 stores and some backends don't support consolidation
+
+
 def _persist_annotation_elements(
     sdata_obj: sd.SpatialData,
     original_path: Path,
@@ -302,17 +373,9 @@ def _persist_annotation_elements(
             ignore=_zarr_store_copy_ignore,
         )
 
-    write_kw = _write_element_kwargs_for_zarr_root(save_path)
-
-    target = read_spatialdata_zarr(save_path)
-
-    if "tissue_regions" in sdata_obj.labels:
-        target.labels["tissue_regions"] = sdata_obj.labels["tissue_regions"]
-        target.write_element("tissue_regions", overwrite=True, **write_kw)
-
-    if "tissue_regions_table" in sdata_obj.tables:
-        target.tables["tissue_regions_table"] = sdata_obj.tables["tissue_regions_table"]
-        target.write_element("tissue_regions_table", overwrite=True, **write_kw)
+    labels = ("tissue_regions",) if "tissue_regions" in sdata_obj.labels else ()
+    tables = ("tissue_regions_table",) if "tissue_regions_table" in sdata_obj.tables else ()
+    _write_elements_to_store(sdata_obj, save_path, labels=labels, tables=tables)
 
 
 def sync_spatialdata_to_store(
@@ -327,19 +390,7 @@ def sync_spatialdata_to_store(
     Chooses NGFF / SpatialData writers compatible with Zarr v2 vs v3 *store roots*.
     The store must already exist (e.g. after ``shutil.copytree`` from a template).
     """
-    store_path = Path(store_path)
-    write_kw = _write_element_kwargs_for_zarr_root(store_path)
-    target = read_spatialdata_zarr(store_path)
-    for name in labels:
-        if name not in sdata_obj.labels:
-            raise KeyError(f"Label {name!r} not in in-memory SpatialData")
-        target.labels[name] = sdata_obj.labels[name]
-        target.write_element(name, overwrite=True, **write_kw)
-    for name in tables:
-        if name not in sdata_obj.tables:
-            raise KeyError(f"Table {name!r} not in in-memory SpatialData")
-        target.tables[name] = sdata_obj.tables[name]
-        target.write_element(name, overwrite=True, **write_kw)
+    _write_elements_to_store(sdata_obj, Path(store_path), labels=labels, tables=tables)
 
 
 # ---------------------------------------------------------------------------
@@ -402,12 +453,19 @@ class RegionAnnotationWidget:
                     }
                 print(f"Loaded {len(self.annotations)} existing annotations")
 
-            # Downsample existing mask for painting.
-            print(f"Downsampling existing mask {existing_mask.shape} -> {self.paint_shape} ({self.downsample}x)...")
+            # Downsample existing mask to paint resolution.
+            # The stored label may already be at paint resolution (saved by this
+            # tool) or at full resolution (e.g. from an external source).
+            # Compute the actual stride needed rather than always using self.downsample.
             if _is_dask_array(existing_mask):
                 existing_mask = existing_mask.compute()
             existing_mask = np.asarray(existing_mask)
-            paint_mask = existing_mask[:: self.downsample, :: self.downsample].copy()
+            ds = max(1, existing_mask.shape[0] // self.paint_shape[0])
+            print(
+                f"Loading existing mask {existing_mask.shape} -> {self.paint_shape} "
+                f"(stride {ds}x)..."
+            )
+            paint_mask = existing_mask[::ds, ::ds].copy()
             # Ensure shape matches exactly (rounding).
             paint_mask = paint_mask[: self.paint_shape[0], : self.paint_shape[1]]
 

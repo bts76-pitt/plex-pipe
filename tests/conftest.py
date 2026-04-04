@@ -47,22 +47,29 @@ if importlib.util.find_spec("napari") is None:
 def make_minimal_spatialdata_zarr(
     path: Path,
     *,
-    image_shape: tuple[int, int, int] = (2, 128, 128),
-    chunk_size: tuple[int, int, int] = (1, 64, 64),
+    spatial_shape: tuple[int, int] = (512, 512),
+    channels: list[str] | None = None,
+    chunk_size: tuple[int, int] = (64, 64),
     scale_factors: list[int] | None = None,
     with_labels: bool = True,
     zarr_format: int = 3,
 ) -> Path:
     """Create a tiny SpatialData Zarr store for use in tests.
 
+    Matches the format produced by ``CoreAssembler``: each channel is a
+    separate ``(1, Y, X)`` Image2D element, which is what the annotator
+    and quantification stages expect.
+
     Parameters
     ----------
     path:
         Destination path for the ``.zarr`` directory.
-    image_shape:
-        ``(C, Y, X)`` shape of the synthetic image.
+    spatial_shape:
+        ``(Y, X)`` spatial dimensions of each channel image.
+    channels:
+        Channel names.  Defaults to ``["DAPI", "CD3"]``.
     chunk_size:
-        ``(C, Y, X)`` chunk shape for the image array.
+        ``(Y, X)`` chunk shape for image arrays.
     scale_factors:
         Pyramid downscale factors.  Defaults to ``[2]`` (one extra level).
     with_labels:
@@ -86,17 +93,24 @@ def make_minimal_spatialdata_zarr(
 
     if scale_factors is None:
         scale_factors = [2]
+    if channels is None:
+        channels = ["DAPI", "CD3"]
 
     rng = np.random.default_rng(42)
-    c, h, w = image_shape
+    h, w = spatial_shape
+    full_chunk = (1, chunk_size[0], chunk_size[1])
 
-    image = Image2DModel.parse(
-        data=rng.integers(0, 1000, image_shape, dtype=np.uint16),
-        dims=("c", "y", "x"),
-        scale_factors=scale_factors,
-        chunks=chunk_size,
-    )
-    elements: dict[str, Any] = {"images": {"image": image}}
+    images: dict[str, Any] = {}
+    for ch in channels:
+        data = rng.integers(0, 1000, (1, h, w), dtype=np.uint16)
+        images[ch] = Image2DModel.parse(
+            data=data,
+            dims=("c", "y", "x"),
+            scale_factors=scale_factors,
+            chunks=full_chunk,
+        )
+
+    elements: dict[str, Any] = {"images": images}
 
     if with_labels:
         label_data = rng.integers(1, 5, (h, w), dtype=np.int32)
@@ -105,7 +119,7 @@ def make_minimal_spatialdata_zarr(
             data=label_data,
             dims=("y", "x"),
             scale_factors=scale_factors,
-            chunks=(chunk_size[1], chunk_size[2]),
+            chunks=chunk_size,
         )
         elements["labels"] = {"tissue_regions": labels}
 
